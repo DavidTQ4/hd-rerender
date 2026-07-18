@@ -319,6 +319,7 @@ def cmd_render(args) -> int:
     ok = bad = 0
     t0 = time.time()
     fails: list[tuple[str, str]] = []
+    reasons: Counter = Counter()
 
     def work_one(item):
         b, c = item
@@ -331,19 +332,30 @@ def cmd_render(args) -> int:
             if err:
                 bad += 1
                 fails.append((b, err))
+                reasons[err.split(':')[0].strip()] += 1
             else:
                 ok += 1
             done = ok + bad
             if done % 25 == 0 or done == len(work):
                 rate = done / max(0.001, time.time() - t0)
                 eta = (len(work) - done) / max(0.001, rate)
-                print(f'  {done}/{len(work)}  {rate:.2f}/s  eta {eta/60:.1f}min  ok={ok} bad={bad}')
+                top = ', '.join(f'{r}={n}' for r, n in reasons.most_common(3))
+                print(f'  {done}/{len(work)}  {rate:.2f}/s  eta {eta/60:.1f}min  ok={ok} bad={bad}'
+                      + (f'  [{top}]' if top else ''))
 
     print(f'[render] done: {ok} ok, {bad} failed, {time.time()-t0:.0f}s')
+    for reason, n in reasons.most_common():
+        print(f'   {reason:24s} {n}')
     for b, e in fails[:20]:
         print(f'   FAIL {b}: {e}', file=sys.stderr)
     if len(fails) > 20:
-        print(f'   ... +{len(fails)-20} more', file=sys.stderr)
+        print(f'   ... +{len(fails)-20} more (full list in render_report.json)', file=sys.stderr)
+
+    report = {'variant': variant, 'total': len(work), 'ok': ok, 'failed': bad,
+              'reasons': dict(reasons.most_common()), 'failed_files': sorted(fails)}
+    report_path = RENDER / variant / 'render_report.json'
+    report_path.write_text(json.dumps(report, indent=1), encoding='utf-8')
+    print(f'   report: {report_path}')
     return 0 if bad < max(5, len(work)//20) else 1
 
 
