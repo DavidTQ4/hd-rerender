@@ -206,7 +206,11 @@ def load_config(path: Path) -> dict:
             f'create it with: comfy_root, comfy_api\n'
             f'see {THIS_DIR / "hd_rerender.config.example.json"}'
         )
-    with path.open('r', encoding='utf-8') as f:
+    # utf-8-sig transparently strips a leading BOM if present and is
+    # otherwise identical to utf-8 - PowerShell's `Out-File -Encoding utf8`
+    # writes a BOM by default (only `utf8NoBOM`, PS7+ only, doesn't), which
+    # plain utf-8 here would reject with a cryptic JSONDecodeError.
+    with path.open('r', encoding='utf-8-sig') as f:
         cfg = json.load(f)
     for key in ('comfy_root', 'comfy_api'):
         if key not in cfg:
