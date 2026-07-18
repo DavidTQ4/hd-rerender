@@ -72,6 +72,11 @@ vs. the DAT2 variant. Drop in from your preferred PBRify release.
 If you have a generic-purpose model, `4x-UltraSharp.pth` is the standard
 fallback — download from <https://openmodeldb.info/models/4x-UltraSharp>.
 
+
+### 3. Comfy Custom Node File
+
+Copy `hd-rerender/comfyui_custom_nodes/swg_batch_io.py` to `<ComfyUI>/custom_nodes/`.
+
 ### 3. config
 
 Copy `hd_rerender.config.example.json` → `hd_rerender.config.json` and edit:
