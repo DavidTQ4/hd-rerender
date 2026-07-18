@@ -104,7 +104,7 @@ SKY_CONTAINS  = ('_sky_', '_sky.')
 SKY_NOT       = ('skyskraper', 'skyscraper', 'skyhook')   # buildings, not sky
 
 SPECIAL_SUFFIX_RE = re.compile(
-    r'_(n[0-9]?|s[0-9]?|norm|normal|spec|spc|det|a|b|d|e|g|h|m|hue)\.dds$',
+    r'_(n[0-9]*|s[0-9]*|norm|normal|spec|spc|det|a|b|d|e|g|h|m|hue)\.dds$',
     re.IGNORECASE,
 )
 
