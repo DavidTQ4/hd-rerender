@@ -55,10 +55,10 @@ ComfyUI model, via `QUALITY_MODELS` in `hd_rerender.py`. All three tiers
 currently point at the same model (SPAN) — direct testing found it faster
 than the alternatives tried, with no vegetation-hallucination issue observed
 on architecture either, so there's no validated reason yet to run a
-different model for any tier. `QUALITY_MODELS` has commented-out example
-lines showing how to point `low`/`high` at a different model once one is
-validated for that purpose. `--model NAME` overrides `--quality` entirely
-for one-off experiments.
+different model for any tier. See **Changing what --quality does** below
+for exactly how to point a tier at a different model once one is validated
+for that purpose. `--model NAME` overrides `--quality` entirely for one-off
+experiments.
 
 ## One-time setup
 
@@ -168,6 +168,54 @@ python hd_rerender.py --tre $src repack    # ~1 min,  <stem>_hd.tre next to the 
 --max-dim N          hard cap on shipped texture width/height (default 2048)
 --max-source-dim N   skip sources above this size on their longest side; they
                      ship as originals (default 512)
+```
+
+## Changing what --quality does
+
+`QUALITY_MODELS` in `hd_rerender.py` (near the top, alongside
+`EXCLUDED_CATEGORIES`) is the only thing `--quality` reads:
+
+```python
+SPAN     = '4x-PBRify_UpscalerSPANV4.pth'
+DAT2     = '4x-PBRify_UpscalerDAT2_V1.pth'
+DEVIANCE = '4x_BS_DevianceMIP.pth'
+
+QUALITY_MODELS = {
+    'low':  SPAN,
+    'med':  SPAN,
+    'high': SPAN,
+}
+```
+
+All three tiers currently point at the same model — there's no validated
+reason yet to run a different one for `low` or `high`. `DAT2`/`DEVIANCE` are
+already defined (left over from an earlier per-category design) specifically
+so a future author can wire a tier to one without retyping the filename.
+
+To make a tier actually differ, once you've validated a specific model for
+that purpose:
+
+1. Drop that model's `.pth` into `<ComfyUI>/models/upscale_models/` (same
+   as setup step 2 above).
+2. Edit the relevant line in `QUALITY_MODELS` — e.g. to make `high` use
+   DAT2 instead of SPAN:
+   ```python
+   QUALITY_MODELS = {
+       'low':  SPAN,
+       'med':  SPAN,
+       'high': DAT2,
+   }
+   ```
+   (`DAT2` doesn't have to be one of the three predefined constants — any
+   string filename works, e.g. `'high': '4x-SomeOtherModel.pth'`.)
+3. Save. No other code changes needed — `python hd_rerender.py --tre X
+   --quality high upscale` now uses DAT2; `low`/`med` are unaffected.
+
+For a one-off test without editing any code, use `--model NAME` instead —
+it overrides `--quality`'s model choice entirely for that single run, e.g.:
+
+```powershell
+python hd_rerender.py --tre $src --model 4x-PBRify_UpscalerDAT2_V1.pth upscale
 ```
 
 ## Upgrading a staging dir from an older revision
