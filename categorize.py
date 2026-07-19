@@ -82,8 +82,10 @@ UI_CONTAINS = ('cursor',)
 
 SPECIAL_PREFIXES = (
     'grad_',     # gradient LUT strips (sky color ramps, etc.) - the engine
-                 # samples these as lookup data; upscaling shifts the ramp
+    'cels_',     # samples these as lookup data; upscaling shifts the ramp
     'skybox_',   # skybox faces authored without the cube-map header flag
+    'dirt_',     #
+    'frst_',
 )
 SPECIAL_CONTAINS = (
     '_pattern',  # character face/body customization index patterns - the
@@ -95,14 +97,14 @@ SPECIAL_CONTAINS = (
                  # Costs a few safe skips (weapon "_head" parts etc.) but
                  # face corruption is far worse than a non-HD vibroblade.
     '_eye',      # eye customization set (hum_b_eye.dds/_m.dds/eyespec.dds -
-                 # missing-eyes corruption case). Catches the whole set
+    '_n.',       # missing-eyes corruption case). Catches the whole set
                  # regardless of suffix convention (the bare _m and the
                  # underscore-less eyespec companions don't match
-                 # SPECIAL_SUFFIX_RE, so this needs to stand on its own).
-    '_freckle',  # freckles customization set (hum_f_freckles_s01..s05.dds -
-                 # the original green-face corruption case). Matches every
-                 # numbered variant via substring, without relying on the
-                 # number itself meaning anything (see SPECIAL_SUFFIX_RE's
+    'rock_',     # SPECIAL_SUFFIX_RE, so this needs to stand on its own).
+    'hum_f_',    # freckles customization set (hum_f_freckles_s01..s05.dds -
+    'hum_m_',    # the original green-face corruption case). Matches every
+    'light_',    # numbered variant via substring, without relying on the
+    'water_',    # number itself meaning anything (see SPECIAL_SUFFIX_RE's
                  # comment on why numbered suffixes aren't used as a rule).
 )
 
