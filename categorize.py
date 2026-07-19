@@ -99,6 +99,11 @@ SPECIAL_CONTAINS = (
                  # regardless of suffix convention (the bare _m and the
                  # underscore-less eyespec companions don't match
                  # SPECIAL_SUFFIX_RE, so this needs to stand on its own).
+    '_freckle',  # freckles customization set (hum_f_freckles_s01..s05.dds -
+                 # the original green-face corruption case). Matches every
+                 # numbered variant via substring, without relying on the
+                 # number itself meaning anything (see SPECIAL_SUFFIX_RE's
+                 # comment on why numbered suffixes aren't used as a rule).
 )
 
 # Skydome imagery: not palette data, but the arch bucket's Lanczos-only
@@ -108,17 +113,18 @@ SKY_PREFIXES  = ('sky_', 'cloudtile_', 'env_')
 SKY_CONTAINS  = ('_sky_', '_sky.')
 SKY_NOT       = ('skyskraper', 'skyscraper', 'skyhook')   # buildings, not sky
 
-# Numbered/named channel-data suffixes - narrower than a blanket human-texture
-# exclude (see git history for the hum_ prefix this replaced): _n01/_s01-style
-# suffixes are SWG's convention for indexed customization/channel variants
-# (hum_f_freckles_s01.dds - a face-blemish INDEX map, not real color imagery -
-# is the original green-face/corruption case this exists for), while
-# norm/normal/spec/spc/det/hue are explicit channel-type names. Deliberately
-# does NOT include bare single letters (_a/_b/_d/_e/_g/_h/_m) - those collide
-# with ordinary color-variant diffuse naming (armor_chest_a.dds) and were the
-# actual false-positive risk in the old version of this pattern.
+# Explicit channel-type name suffixes only - NOT numbered variants (_s01,
+# _n01, etc). Numbered suffixes turned out to be a common plain style/variant
+# naming convention across many ordinary texture types in these TREs (e.g.
+# wall_s01.dds), not a reliable signal of index/channel data on their own -
+# using them here would silently exclude a large number of legitimate
+# textures from upscaling. norm/normal/spec/spc/det/hue name an actual
+# channel type and are far more specific, so they stay. Known customization-
+# overlay families that DO need protection (freckles, eye - both palette/
+# index data, not real color imagery) are matched by name instead, in
+# SPECIAL_CONTAINS below - surgical per-family, not a suffix heuristic.
 SPECIAL_SUFFIX_RE = re.compile(
-    r'_(n[0-9]*|s[0-9]*|norm|normal|spec|spc|det|hue)\.dds$',
+    r'_(norm|normal|spec|spc|det|hue)\.dds$',
     re.IGNORECASE,
 )
 
