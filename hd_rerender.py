@@ -383,7 +383,8 @@ def phase_extract(args, cfg: dict) -> int:
     # original archive for those entries.
     from categorize import categorize
     cats: dict[str, list[str]] = {k: [] for k in
-                                  ('cube', 'special', 'ui', 'sky', 'arch', 'organic', 'hardsurface')}
+                                  ('cube', 'special', 'ui', 'sky', 'dontrescale',
+                                   'arch', 'organic', 'hardsurface')}
     for name in manifest['entries']:
         cats[categorize(name, out_dir / 'texture' / name)].append(name)
     for k in cats:
