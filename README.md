@@ -20,12 +20,14 @@ order).
         ▼                                                                    │
    staging/png_in/*.png                                                      │
         │                                                                    │
-        │ upscale  (ComfyUI /prompt API, one model for everything - see      │
-        │           Category routing / --quality below)                     │
+        │ upscale  (ComfyUI /prompt API - one model for most textures, see   │
+        │           Category routing / --quality below; a separate fixed     │
+        │           1x model for the dontrescale bucket)                     │
         ▼                                                                    │
    staging/png_out/*.png                                                     │
         │                                                                    │
-        │ encode   (texconv -f <orig BCx> -m 0 = full mip chain)             │
+        │ encode   (texconv -f <orig BCx> -m 0 = full mip chain; ship        │
+        │           scale is 1x for dontrescale, --ship-scale otherwise)     │
         ▼                                                                    │
    staging/dds_out/texture/*.dds                                             │
         │                                                                    │
@@ -39,14 +41,26 @@ Run individual phases for diagnosis, or `all` for the full pipeline.
 
 **Category routing:** `extract` buckets every texture via `categorize.py` and
 writes `staging/categories.json`. The `cube`, `special`, `ui`, and `sky`
-buckets (cube maps, normal/spec/mask channel data, gradient LUTs,
-customization index patterns, UI atlases, load screens, skydomes) are
-**never upscaled or shipped** — the engine reads those as structured data,
-not imagery, and upscaled versions corrupt load screens, character face
-tinting, and sky gradients in-game. The client falls back to the original
-archive for them. Every other texture (`arch`/`organic`/`hardsurface`) gets
-identical treatment — one ComfyUI model, chosen by `--quality` (see below),
-one shipped scale (`--ship-scale`). `repack` also drops any strays left in
+buckets (cube maps, normal/spec/mask channel data, gradient LUTs/ramps, UI
+atlases, load screens, skydomes) are **never upscaled or shipped** — the
+engine reads those as structured data, not imagery, and upscaled versions
+corrupt load screens and sky gradients in-game. The client falls back to
+the original archive for them.
+
+The `dontrescale` bucket is different: it's real diffuse imagery (character
+face/head/eye/freckle/pattern textures) that's tinted through a runtime
+palette system. Regular geometric upscaling shifts those index/palette
+colors — the source of two real corruption incidents (green-face freckles,
+missing eyes) — so instead of a hard skip, these get a **same-resolution
+("1x") ComfyUI restoration pass** with a dedicated fixed model
+(`DONTRESCALE_MODEL` in `hd_rerender.py`, override via config's
+`dontrescale_model` key), always shipped at 1x regardless of
+`--ship-scale`. It's still decoded, still upscaled (just at 1x), and still
+shipped — unlike `cube`/`special`/`ui`/`sky`.
+
+Every remaining texture (`arch`/`organic`/`hardsurface`) gets identical
+treatment — one ComfyUI model, chosen by `--quality` (see below), one
+shipped scale (`--ship-scale`). `repack` also drops any strays left in
 `dds_out` by runs that predate the routing, so re-running `repack` alone
 repairs an old staging dir in place.
 
@@ -253,6 +267,46 @@ custom` with no `custom_model` set in config fails fast with a clear error
 telling you what to add, rather than silently falling back to something
 else.
 
+## The dontrescale category
+
+Character customization/diffuse imagery (face/head/eye/freckle/pattern
+textures — see `DONTRESCALE_CONTAINS` in `categorize.py`) is tinted through
+a runtime palette system. Regular upscaling's geometric resampling shifts
+those index/palette colors — the root cause of two prior in-game corruption
+incidents (green-tinted freckles, missing eyes) — so instead of the normal
+`--quality`-driven 4x pass, these get a **fixed, separate, same-resolution
+("1x") ComfyUI restoration pass**: no geometric upscale, so there's nothing
+to resample and shift the palette colors.
+
+This model is entirely independent of `--quality`/`--model` — it never
+changes with `--quality low/med/high/custom` or `--model`, since those only
+ever affect the main (non-`dontrescale`) pass. The default is:
+
+```python
+DONTRESCALE_MODEL = '1x-SuperScale_SPAN.safetensors'
+```
+
+Drop that model into `<ComfyUI>/models/upscale_models/` alongside your main
+upscale model (same setup step 2 as above — despite the different file
+extension, ComfyUI resolves it by filename the same way). To override it
+without editing code, set `dontrescale_model` in `hd_rerender.config.json`:
+
+```jsonc
+{
+  "comfy_root": "C:/ComfyUI_windows_portable/ComfyUI",
+  "comfy_api": "http://127.0.0.1:8188",
+  "dontrescale_model": "1x-SomeOtherRestorationModel.safetensors"
+}
+```
+
+`upscale` submits `dontrescale` files to ComfyUI as a separate batch group
+(output tagged under `swg_hd_batch/dontrescale/` for debuggability) using
+this model; `encode` always targets 1x for these files regardless of
+`--ship-scale`. Alpha restoration and every other part of the pipeline
+(batching, retry-on-OOM, mip regeneration, repack) is identical to the main
+path — `dontrescale` is not in `EXCLUDED_CATEGORIES`, so it's decoded,
+upscaled (at 1x), encoded, and shipped like any other texture.
+
 ## Upgrading a staging dir from an older revision
 
 Every phase's resumability check is "does the output file already exist" —
@@ -341,7 +395,7 @@ changes.
 | `no SaveImage output` for some files          | model OOMed on a huge texture — lower `--workers` to 1, or lower `--batch` |
 | upscale phase hangs on one file               | raise `--timeout`, check GPU temp                    |
 | textures look wrong for their content type (e.g. hallucinated detail where there shouldn't be any) | try a different `--model` — see Quality tiers; not every model suits every content type equally |
-| a specific texture is corrupted/discolored (e.g. character face, eyes) | it's probably index/customization data that `categorize.py` didn't catch — see `categorize.py`'s `SPECIAL_CONTAINS`/`SPECIAL_SUFFIX_RE` and add a targeted rule for it |
+| a specific texture is corrupted/discolored (e.g. character face, eyes) | it's probably palette/customization imagery that `categorize.py` didn't catch — see `DONTRESCALE_CONTAINS` (real diffuse imagery, gets a 1x restore) vs `SPECIAL_CONTAINS`/`SPECIAL_SUFFIX_RE` (pure lookup data, hard skip) and add a targeted rule to the right one |
 | black/magenta blocks in-game                  | encode picked wrong format — inspect `manifest.json` |
 | client doesn't load HD TRE                    | not in load order, or load-order priority too low    |
 | game crashes loading a specific texture        | dimensions exceed engine cap (some shaders cap at 2048) — exclude that file |
@@ -353,7 +407,7 @@ and repack; the manifest stays intact so re-running extract won't reset it.
 
 ```
 hd_rerender.py                       main driver (subcommands: extract/decode/upscale/encode/repack/all)
-categorize.py                        per-texture category routing (arch/organic/hardsurface excluded from special/cube/ui/sky)
+categorize.py                        per-texture category routing (arch/organic/hardsurface upscaled normally; dontrescale gets a 1x restore; special/cube/ui/sky excluded)
 hd_rerender.config.example.json      copy to hd_rerender.config.json
 workflows/upscale_4x_batch.json      ComfyUI /prompt API workflow template (batch load/save custom nodes)
 comfyui_custom_nodes/swg_batch_io.py SWGLoadImageBatch/SWGSaveImageBatch - copy into ComfyUI's custom_nodes/

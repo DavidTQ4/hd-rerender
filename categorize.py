@@ -4,8 +4,14 @@ Categorize every texture in the manifest into one of these buckets:
 
   cube        - cube map (DDS_CAPS2_CUBEMAP flag set) - DON'T TOUCH
                 upscale pipeline destroys the 6-face structure
-  special     - normal/spec/alpha/blend/etc (non-color channel data) - DON'T TOUCH
-                AI upscalers destroy encoded vector/intensity data
+  special     - normal/spec/alpha/blend/gradient LUT/etc (non-color channel
+                data) - DON'T TOUCH, AI upscalers destroy encoded vector/
+                intensity/lookup data
+  dontrescale - character customization/diffuse imagery tinted through a
+                runtime palette system (face/head/eye/freckle/pattern) -
+                SAME-RESOLUTION AI RESTORATION ONLY, no geometric upscale.
+                Regular upscaling's resampling shifts the index/palette
+                colors; a 1x pass has nothing to resample
   ui          - UI panels, cursors, particles - DON'T TOUCH
                 engine has fixed pixel coords / D3D9 cursor constraints
   arch        - architectural / environmental / hard surfaces - USE LANCZOS
@@ -86,19 +92,31 @@ SPECIAL_PREFIXES = (
     'skybox_',   # skybox faces authored without the cube-map header flag
 )
 SPECIAL_CONTAINS = (
-    '_pattern',  # character face/body customization index patterns - the
-                 # palette system reads these as indices, not imagery
     'gradient',  # gradient LUTs (gradient_sky1, sw_gradient_*, ...)
     '_grad.',    # gradient LUTs named as a suffix (glass_grad.dds etc.)
-    '_face',     # species face/head diffuse - tinted through the palette
-    '_head',     # system at runtime; resampling shifts the index colors.
-                 # Costs a few safe skips (weapon "_head" parts etc.) but
-                 # face corruption is far worse than a non-HD vibroblade.
+)
+
+# Character customization/diffuse imagery, tinted through a runtime palette
+# system - unlike SPECIAL_* above (pure lookup/ramp data with no "image" to
+# speak of), these ARE real diffuse imagery, just recolored later at
+# runtime. Regular upscaling's geometric resampling shifts the index/
+# palette colors (the green-face freckles and missing-eyes corruption cases
+# this was split out from) - but a same-resolution ("1x") restoration pass
+# has no resampling to shift anything, so these get routed to a dedicated
+# 1x ComfyUI model instead of a hard skip. See DONTRESCALE_MODEL in
+# hd_rerender.py.
+DONTRESCALE_PREFIXES = ()
+DONTRESCALE_CONTAINS = (
+    '_pattern',  # character face/body customization index patterns
+    '_face',     # species face/head diffuse
+    '_head',     # same palette-tinting system as _face. Costs a few safe
+                 # skips (weapon "_head" parts etc.) but face corruption is
+                 # far worse than a non-restored vibroblade.
     '_eye',      # eye customization set (hum_b_eye.dds/_m.dds/eyespec.dds -
                  # missing-eyes corruption case). Catches the whole set
                  # regardless of suffix convention (the bare _m and the
-                 # underscore-less eyespec companions don't match
-                 # SPECIAL_SUFFIX_RE, so this needs to stand on its own).
+                 # underscore-less eyespec companions don't share a common
+                 # suffix pattern with each other).
     '_freckle',  # freckles customization set (hum_f_freckles_s01..s05.dds -
                  # the original green-face corruption case). Matches every
                  # numbered variant via substring, without relying on the
@@ -165,6 +183,15 @@ def categorize_with_reason(name: str, src_path: Path) -> tuple[str, str]:
     if 'facenormal' in nl:
         return 'special', 'contains:facenormal'
 
+    # 2b) Character customization/diffuse imagery tinted through a runtime
+    # palette system - same-resolution AI restoration, not a hard skip.
+    for p in DONTRESCALE_PREFIXES:
+        if nl.startswith(p):
+            return 'dontrescale', f'prefix:{p}'
+    for c in DONTRESCALE_CONTAINS:
+        if c in nl:
+            return 'dontrescale', f'contains:{c}'
+
     # 3) Special channel data (normal/spec/alpha mask/etc.) - hard skip
     m = SPECIAL_SUFFIX_RE.search(nl)
     if m:
@@ -222,7 +249,7 @@ def main() -> int:
         manifest = json.load(f)
 
     cats: dict[str, list[str]] = {
-        'cube': [], 'special': [], 'ui': [], 'sky': [],
+        'cube': [], 'special': [], 'ui': [], 'sky': [], 'dontrescale': [],
         'arch': [], 'organic': [], 'hardsurface': [],
     }
     for name in manifest['entries']:
