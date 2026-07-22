@@ -29,9 +29,15 @@ DEFAULT_SHIP_SCALE = 4, i.e. ship the model's full native render with no
 downscale).
 
 The DDS format is round-tripped: for every input texture/foo.dds we record
-its width, height, BC format tag, and mipmap-count in manifest.json during
-`decode`, and `encode` uses that tag to pick the right texconv -f flag and
-regenerates a full mipmap chain at the new dimensions.
+its width, height, BC format tag, sRGB-vs-UNORM colorspace, DDPF_ALPHAPIXELS
+header flag, and mipmap-count in manifest.json during `extract` (see
+read_dds_meta), and `encode` uses that to pick the right texconv -f flag
+(texconv_format_for - fails loudly and skips the file rather than guessing
+a format for anything it doesn't recognize) and regenerates the SAME number
+of mip levels the source had (encode_mip_count), not an unconditional full
+chain. Every produced DDS is re-parsed and checked against the dimensions/
+format/mip count it was meant to have (verify_encoded_dds) before it's
+allowed to ship; a mismatch gets discarded so the next run regenerates it.
 
 Configuration: edit hd_rerender.config.json next to this script, or pass
 flags. Required keys:
@@ -74,18 +80,52 @@ DDPF_FOURCC        = 0x00000004
 DDPF_RGB           = 0x00000040
 DDPF_LUMINANCE     = 0x00020000
 
-# Maps our format tag -> texconv -f flag for re-encoding.
-# Order chosen so the most common SWG formats come first.
+# Maps our format tag -> texconv -f flag for re-encoding (UNORM variant).
+# Order chosen so the most common SWG formats come first. RGB8 targets
+# B8G8R8X8_UNORM (32-bit but the X channel is defined as ignored/unused) -
+# genuinely alpha-less, unlike promoting to R8G8B8A8_UNORM which would add
+# a spurious always-opaque alpha channel the original 24-bit source never
+# had. DDS/DXGI has no true 24-bit-packed format, so this is the closest
+# faithful equivalent.
 TEXCONV_FORMAT = {
     'DXT1':  'BC1_UNORM',
     'DXT3':  'BC2_UNORM',
     'DXT5':  'BC3_UNORM',
-    'BC5':   'BC5_UNORM',   # ATI2 (normal maps)
+    'BC5':   'BC5_UNORM',   # ATI2 (normal maps) - no sRGB variant exists
     'BC7':   'BC7_UNORM',
     'RGBA8': 'R8G8B8A8_UNORM',
-    'RGB8':  'R8G8B8A8_UNORM',   # promote 24-bit to 32-bit on re-encode
+    'RGB8':  'B8G8R8X8_UNORM',
     'L8':    'R8_UNORM',
 }
+
+# UNORM -> _SRGB variant, for formats that have one (BC5/L8 don't - BC5 is
+# normal-map vector data, L8 is a legacy 8-bit luminance format with no
+# DXGI colorspace-tagged counterpart in this pipeline).
+TEXCONV_FORMAT_SRGB = {
+    'BC1_UNORM':        'BC1_UNORM_SRGB',
+    'BC2_UNORM':        'BC2_UNORM_SRGB',
+    'BC3_UNORM':        'BC3_UNORM_SRGB',
+    'BC7_UNORM':        'BC7_UNORM_SRGB',
+    'R8G8B8A8_UNORM':   'R8G8B8A8_UNORM_SRGB',
+    'B8G8R8X8_UNORM':   'B8G8R8X8_UNORM_SRGB',
+}
+
+
+def texconv_format_for(meta: dict) -> str | None:
+    """meta['fmt'] (+ meta['srgb']) -> the texconv -f value to re-encode
+    with, or None if meta['fmt'] isn't one we recognize (UNKNOWN, or a
+    header read_dds_meta couldn't classify). None means "do not encode this
+    file" - callers must skip it (ships as the original via client
+    fallback), never silently default to some other format; guessing wrong
+    here means unreadable or corrupt texture data with the wrong bit layout.
+    """
+    base = TEXCONV_FORMAT.get(meta['fmt'])
+    if base is None:
+        return None
+    if meta.get('srgb') and base in TEXCONV_FORMAT_SRGB:
+        return TEXCONV_FORMAT_SRGB[base]
+    return base
+
 
 # texconv formats whose block compressor already spreads a *single* file's
 # work across all available cores (DirectXTex's BC7 encoder in particular).
@@ -93,7 +133,8 @@ TEXCONV_FORMAT = {
 # a small, no-singleproc process pool. Every other format compresses fast
 # per file with little/no internal threading, so those run -singleproc,
 # workers-wide, trading one-file-per-core for one-invocation-uses-all-cores.
-SELF_THREADED_TEXCONV_FORMATS = {'BC7_UNORM'}
+# Both BC7 variants use the same compressor regardless of the sRGB tag.
+SELF_THREADED_TEXCONV_FORMATS = {'BC7_UNORM', 'BC7_UNORM_SRGB'}
 
 # ---------------------------------------------------------------------------
 # Upscale model / quality tiers.
@@ -137,21 +178,30 @@ DEFAULT_SHIP_SCALE = 4   # "medium" ships at the model's full native render, no 
 
 def read_dds_meta(path: Path) -> dict:
     """Parse the 128-byte DDS header (+ 20-byte DX10 extension if present).
-    Returns {'width', 'height', 'fmt', 'mips'} where fmt is one of the keys
-    of TEXCONV_FORMAT or 'UNKNOWN' (caller falls back to BC3).
+    Returns {'width', 'height', 'fmt', 'mips', 'srgb', 'alpha_flag'} where
+    'fmt' is one of the keys texconv_format_for() understands, or 'UNKNOWN'
+    (caller must skip the file, not guess a format - see texconv_format_for).
+    'srgb' distinguishes a DX10 _SRGB DXGI variant from its UNORM twin (the
+    classic FourCC-only path predates DX10's colorspace tag entirely, so it's
+    always False there). 'alpha_flag' is the legacy DDPF_ALPHAPIXELS bit -
+    for DXT1 in particular this is an authoring hint (real alpha-or-not is
+    actually encoded per-block), not a hard guarantee, but it's cheap to
+    record and useful for auditing/validation.
     """
     with path.open('rb') as f:
         head = f.read(128)
     if len(head) < 128 or head[:4] != DDS_MAGIC:
         raise ValueError(f'{path}: not a DDS file')
 
-    height   = struct.unpack('<I', head[12:16])[0]
-    width    = struct.unpack('<I', head[16:20])[0]
-    mips     = max(1, struct.unpack('<I', head[28:32])[0])
-    pf_flags = struct.unpack('<I', head[80:84])[0]
-    fourcc   = head[84:88]
-    rgb_bits = struct.unpack('<I', head[88:92])[0]
-    a_mask   = struct.unpack('<I', head[104:108])[0]
+    height     = struct.unpack('<I', head[12:16])[0]
+    width      = struct.unpack('<I', head[16:20])[0]
+    mips       = max(1, struct.unpack('<I', head[28:32])[0])
+    pf_flags   = struct.unpack('<I', head[80:84])[0]
+    fourcc     = head[84:88]
+    rgb_bits   = struct.unpack('<I', head[88:92])[0]
+    a_mask     = struct.unpack('<I', head[104:108])[0]
+    alpha_flag = bool(pf_flags & DDPF_ALPHAPIXELS)
+    srgb       = False
 
     if pf_flags & DDPF_FOURCC:
         if fourcc == b'DXT1':            fmt = 'DXT1'
@@ -164,11 +214,14 @@ def read_dds_meta(path: Path) -> dict:
                 f.seek(128)
                 ext = f.read(20)
             dxgi = struct.unpack('<I', ext[0:4])[0]
-            # DXGI_FORMAT_BC7_UNORM = 98, DXGI_FORMAT_BC7_UNORM_SRGB = 99
-            if   dxgi in (98, 99):       fmt = 'BC7'
-            elif dxgi in (71, 72):       fmt = 'DXT1'
-            elif dxgi in (74, 75):       fmt = 'DXT3'
-            elif dxgi in (77, 78):       fmt = 'DXT5'
+            # DXGI_FORMAT_BC7_UNORM=98/_SRGB=99, BC1(DXT1)=71/72,
+            # BC2(DXT3)=74/75, BC3(DXT5)=77/78 - the _SRGB tag is the only
+            # difference between each pair; BC5 (normal-map data) has no
+            # sRGB variant in DXGI at all.
+            if   dxgi in (98, 99):       fmt, srgb = 'BC7',  dxgi == 99
+            elif dxgi in (71, 72):       fmt, srgb = 'DXT1', dxgi == 72
+            elif dxgi in (74, 75):       fmt, srgb = 'DXT3', dxgi == 75
+            elif dxgi in (77, 78):       fmt, srgb = 'DXT5', dxgi == 78
             elif dxgi == 83:             fmt = 'BC5'
             else:                        fmt = 'UNKNOWN'
         else:                            fmt = 'UNKNOWN'
@@ -180,7 +233,10 @@ def read_dds_meta(path: Path) -> dict:
     elif pf_flags & DDPF_LUMINANCE:      fmt = 'L8'
     else:                                fmt = 'UNKNOWN'
 
-    return {'width': width, 'height': height, 'fmt': fmt, 'mips': mips}
+    return {
+        'width': width, 'height': height, 'fmt': fmt, 'mips': mips,
+        'srgb': srgb, 'alpha_flag': alpha_flag,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +349,25 @@ def target_dims(meta: dict, scale: int, max_dim: int) -> tuple[int, int]:
     return (min(meta['width'] * scale, max_dim), min(meta['height'] * scale, max_dim))
 
 
+def max_mip_levels(w: int, h: int) -> int:
+    """Number of levels in a full mip chain down to 1x1 for a w x h base
+    (works for non-power-of-two dims too: int.bit_length() is exactly
+    floor(log2(n))+1 for any positive n)."""
+    return max(w, h, 1).bit_length()
+
+
+def encode_mip_count(meta: dict, target_wh: tuple[int, int]) -> int:
+    """How many mip levels to ask texconv for when re-encoding at
+    target_wh. Uses the SOURCE's own recorded meta['mips'] - the number of
+    levels the artist actually authored - rather than unconditionally
+    regenerating a full chain down to 1x1 at the new (usually larger)
+    shipped size. A texture authored with a short/partial chain keeps that
+    same number of levels, just rendered at the new base size; only clamped
+    down if target_wh is small enough that meta['mips'] would exceed what's
+    physically possible (e.g. after --max-source-dim/--max-dim capping)."""
+    return min(meta['mips'], max_mip_levels(*target_wh))
+
+
 def save_manifest(path: Path, manifest: dict) -> None:
     tmp = path.with_suffix('.json.tmp')
     with tmp.open('w', encoding='utf-8') as f:
@@ -336,12 +411,25 @@ def phase_extract(args, cfg: dict) -> int:
     print(f'[extract] manifest: {len(manifest["entries"])} total ({n_new} added)')
 
     # Distribution report so you know what we're about to encode back to.
+    # dxt1_alpha/srgb_count come from meta.get() defaults - manifest entries
+    # written before this hardening pass predate both fields and will read
+    # as 0 for them until that entry is re-extracted (delete manifest.json
+    # to force a full re-parse; see README's staging-upgrade notes).
     fmt_counts: dict[str, int] = {}
+    dxt1_alpha_count = 0
+    srgb_count = 0
     for m in manifest['entries'].values():
         fmt_counts[m['fmt']] = fmt_counts.get(m['fmt'], 0) + 1
+        if m['fmt'] == 'DXT1' and m.get('alpha_flag'):
+            dxt1_alpha_count += 1
+        if m.get('srgb'):
+            srgb_count += 1
     print('[extract] format distribution:')
     for fmt, n in sorted(fmt_counts.items(), key=lambda kv: -kv[1]):
         print(f'    {fmt:8s} {n:6d}')
+    print(f'    DXT1 with alpha-pixels header flag set: {dxt1_alpha_count} '
+          f'(authoring hint only - real alpha-or-not is per-block)')
+    print(f'    sRGB-tagged (DX10 _SRGB variant): {srgb_count}')
 
     # Category routing. Cube maps, UI atlases, and channel-data textures
     # (normals/masks, gradient LUTs, customization patterns) are data the
@@ -878,6 +966,31 @@ def prepare_ship_png(png_out: Path, png_in_dir: Path, ship_png: Path,
         return (png_out.name, False, repr(e))
 
 
+def verify_encoded_dds(path: Path, expected_wh: tuple[int, int],
+                        expected_tex_fmt: str, expected_mips: int) -> str | None:
+    """Re-parse a just-written DDS and confirm it actually is what we asked
+    texconv for: same dims, same format (re-derived via texconv_format_for
+    on the reparsed header, so a mislabeled/corrupt output is caught the
+    same way an input would be), same mip count. Returns None if OK, else a
+    description of the mismatch. Guards against texconv silently ignoring a
+    flag, writing over a stale file of a different format, or a corrupted
+    write - all of which would otherwise ship undetected.
+    """
+    try:
+        meta = read_dds_meta(path)
+    except Exception as e:
+        return f'cannot read produced DDS: {e}'
+    got_wh = (meta['width'], meta['height'])
+    if got_wh != expected_wh:
+        return f'dimension mismatch: got {got_wh}, expected {expected_wh}'
+    got_tex_fmt = texconv_format_for(meta)
+    if got_tex_fmt != expected_tex_fmt:
+        return f'format mismatch: got {got_tex_fmt!r}, expected {expected_tex_fmt!r}'
+    if meta['mips'] != expected_mips:
+        return f'mip count mismatch: got {meta["mips"]}, expected {expected_mips}'
+    return None
+
+
 def phase_encode(args, cfg: dict) -> int:
     if not TEXCONV.exists():
         raise SystemExit(f'texconv not found at {TEXCONV}')
@@ -894,9 +1007,11 @@ def phase_encode(args, cfg: dict) -> int:
     # First pass: figure out which files actually need work (manifest lookup
     # + skip-existing), without doing any CPU work yet.
     excluded = load_excluded_names(Path(args.staging))
-    pending: list[tuple[Path, str, str, tuple[int, int]]] = []   # (png, dds_name, tex_fmt, target_wh)
+    # (png, dds_name, tex_fmt, target_wh, mips)
+    pending: list[tuple[Path, str, str, tuple[int, int], int]] = []
     skipped = 0
     skipped_excluded = 0
+    skipped_unknown_fmt = 0
     for png in in_dir.glob('*.png'):
         dds_name = png.stem + '.dds'
         if dds_name in excluded:                 # stale upscale from an older run
@@ -909,13 +1024,23 @@ def phase_encode(args, cfg: dict) -> int:
         if max(meta['width'], meta['height']) > args.max_source_dim:
             skipped_excluded += 1                # stale render of a high-res source
             continue
-        tex_fmt = TEXCONV_FORMAT.get(meta['fmt'], 'BC3_UNORM')
+        tex_fmt = texconv_format_for(meta)
+        if tex_fmt is None:
+            # Never guess a format for data we don't recognize - the wrong
+            # bit layout produces a corrupt or unreadable texture in-game.
+            # Skip it entirely; it ships as the original via client
+            # fallback, same as an EXCLUDED_CATEGORIES file.
+            skipped_unknown_fmt += 1
+            print(f'  WARN {dds_name}: unrecognized DDS format (fmt={meta["fmt"]!r}), '
+                  f'skipping - will ship as original', file=sys.stderr)
+            continue
         target = out_dir / dds_name
         if target.exists() and not args.overwrite:
             skipped += 1
             continue
         target_wh = target_dims(meta, args.ship_scale, args.max_dim)
-        pending.append((png, dds_name, tex_fmt, target_wh))
+        mips = encode_mip_count(meta, target_wh)
+        pending.append((png, dds_name, tex_fmt, target_wh, mips))
 
     # Ship-prep (downscale to ship size + alpha re-attach) is pure per-file
     # CPU work with no shared state, so fan it out across processes.
@@ -925,10 +1050,10 @@ def phase_encode(args, cfg: dict) -> int:
     if pending:
         with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
             results = pool.map(prepare_ship_png,
-                               [p for p, _dn, _f, _t in pending],
+                               [p for p, _dn, _f, _t, _m in pending],
                                [png_in_dir] * len(pending),
-                               [ship_dir / p.name for p, _dn, _f, _t in pending],
-                               [t for _p, _dn, _f, t in pending])
+                               [ship_dir / p.name for p, _dn, _f, _t, _m in pending],
+                               [t for _p, _dn, _f, t, _m in pending])
             for name, fixed, err in results:
                 if err:
                     prep_errors += 1
@@ -940,23 +1065,29 @@ def phase_encode(args, cfg: dict) -> int:
             print(f'  {prep_errors} files failed ship-prep and are skipped this run',
                   file=sys.stderr)
 
-    # Group by target texconv format so we can batch one process per format.
+    # Group by (target texconv format, mip count) so we can batch one
+    # texconv process per group - both -f and -m are per-invocation flags,
+    # and mips now varies by source (see encode_mip_count), not just format.
     # Encode reads the prepared PNGs in png_ship/, not the raw 4x renders.
-    by_fmt: dict[str, list[tuple[Path, str]]] = {}
-    for png, dds_name, tex_fmt, _t in pending:
+    by_group: dict[tuple[str, int], list[tuple[Path, str, tuple[int, int]]]] = {}
+    for png, dds_name, tex_fmt, target_wh, mips in pending:
         if png.name in prep_failed:
             continue
-        by_fmt.setdefault(tex_fmt, []).append((ship_dir / png.name, dds_name))
+        by_group.setdefault((tex_fmt, mips), []).append(
+            (ship_dir / png.name, dds_name, target_wh))
 
-    print(f'[encode] {sum(len(v) for v in by_fmt.values())} PNG -> DDS  '
+    print(f'[encode] {sum(len(v) for v in by_group.values())} PNG -> DDS  '
           f'({skipped} skipped existing, {skipped_excluded} engine-data/high-res skipped, '
+          f'{skipped_unknown_fmt} unrecognized-format skipped, '
           f'{alpha_fixed} source alphas re-attached)')
 
     BATCH = 100
     t0 = time.time()
-    all_targets: list[Path] = []   # used for source-of-truth presence check
-    for tex_fmt, items in by_fmt.items():
-        print(f'  [{tex_fmt}] {len(items)} files')
+    # (target_path, expected_wh, expected_tex_fmt, expected_mips) for the
+    # post-write validation pass below.
+    all_targets: list[tuple[Path, tuple[int, int], str, int]] = []
+    for (tex_fmt, mips), items in by_group.items():
+        print(f'  [{tex_fmt} m={mips}] {len(items)} files')
         chunks = [items[i:i + BATCH] for i in range(0, len(items), BATCH)]
 
         # BC7's compressor already spreads a single file's block compression
@@ -970,7 +1101,10 @@ def phase_encode(args, cfg: dict) -> int:
         heavy = tex_fmt in SELF_THREADED_TEXCONV_FORMATS
         chunk_workers = min(len(chunks), 3) if heavy else max(1, args.workers)
 
-        # texconv -f <fmt> -m 0 (full chain) -o <dir> input1 input2 ...
+        # texconv -f <fmt> -m <mips> -o <dir> input1 input2 ...
+        # -m uses the SOURCE's own recorded mip count (see encode_mip_count),
+        # not an unconditional full chain - a texture authored with fewer
+        # levels keeps that same depth at the new shipped size.
         # -sepalpha: filter alpha independently of color when generating
         # mips; texconv's default alpha-weighted filter darkens color in
         # low-alpha regions on lower mips (dark-at-distance bug).
@@ -979,7 +1113,7 @@ def phase_encode(args, cfg: dict) -> int:
             '-nologo',
             '-y',
             '-f', tex_fmt,
-            '-m', '0',                 # full mipmap chain at new (4x) size
+            '-m', str(mips),
             '-sepalpha',
             '-ft', 'dds',
             '-o', str(out_dir),
@@ -988,7 +1122,7 @@ def phase_encode(args, cfg: dict) -> int:
             base_cmd.append('-singleproc')
 
         def run_chunk(chunk):
-            cmd = base_cmd + [str(p) for (p, _name) in chunk]
+            cmd = base_cmd + [str(p) for (p, _name, _wh) in chunk]
             rc = subprocess.call(cmd, stdout=subprocess.DEVNULL)
             return rc, chunk
 
@@ -1000,18 +1134,33 @@ def phase_encode(args, cfg: dict) -> int:
                 print(f'    WARN texconv rc={rc} on chunk starting '
                       f'{chunk[0][0].name} (checking outputs)', file=sys.stderr)
             # texconv writes <png_stem>.dds; rename to <original dds name>.
-            for png, dds_name in chunk:
+            for png, dds_name, target_wh in chunk:
                 produced = out_dir / (png.stem + '.dds')
                 if produced.exists() and produced.name != dds_name:
                     target = out_dir / dds_name
                     if target.exists():
                         target.unlink()
                     produced.rename(target)
-                all_targets.append(out_dir / dds_name)
+                all_targets.append((out_dir / dds_name, target_wh, tex_fmt, mips))
 
-    ok = sum(1 for t in all_targets if t.exists())
-    bad = len(all_targets) - ok
-    print(f'[encode] done: {ok} ok, {bad} missing, {time.time()-t0:.0f}s')
+    ok = bad = 0
+    for target, expected_wh, tex_fmt, mips in all_targets:
+        if not target.exists():
+            bad += 1
+            continue
+        err = verify_encoded_dds(target, expected_wh, tex_fmt, mips)
+        if err:
+            bad += 1
+            print(f'  WARN {target.name}: {err} - discarding, will retry next run',
+                  file=sys.stderr)
+            # Don't ship a file that doesn't match what we asked for; leaving
+            # it absent means a rerun (with or without --overwrite - the
+            # skip-existing check only looks for the file's presence) will
+            # regenerate it instead of silently shipping bad data.
+            target.unlink(missing_ok=True)
+            continue
+        ok += 1
+    print(f'[encode] done: {ok} ok, {bad} missing/invalid, {time.time()-t0:.0f}s')
     return 0 if bad < max(10, len(all_targets) // 20) else 1
 
 

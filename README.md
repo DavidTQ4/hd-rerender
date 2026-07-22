@@ -25,7 +25,8 @@ order).
         ▼                                                                    │
    staging/png_out/*.png                                                     │
         │                                                                    │
-        │ encode   (texconv -f <orig BCx> -m 0 = full mip chain)             │
+        │ encode   (texconv -f <orig BCx/sRGB> -m <orig mip count>,          │
+        │           then validated against the intended output)              │
         ▼                                                                    │
    staging/dds_out/texture/*.dds                                             │
         │                                                                    │
@@ -272,26 +273,46 @@ re-run.
 ## How re-encoding preserves the original format
 
 The `extract` phase reads each DDS header and records `{width, height, fmt,
-mips}` into `staging/manifest.json`. `fmt` is one of:
+mips, srgb, alpha_flag}` into `staging/manifest.json` (`read_dds_meta`).
+`encode` resolves the actual texconv `-f` flag from `fmt` + `srgb` via
+`texconv_format_for` — `fmt` is one of:
 
-| Tag    | DDS source                 | Re-encode flag         |
-| ------ | -------------------------- | ---------------------- |
-| DXT1   | FOURCC `DXT1`              | `-f BC1_UNORM`         |
-| DXT3   | FOURCC `DXT3`              | `-f BC2_UNORM`         |
-| DXT5   | FOURCC `DXT5`              | `-f BC3_UNORM`         |
-| BC5    | FOURCC `ATI2` or `BC5U`    | `-f BC5_UNORM`         |
-| BC7    | DX10 ext, DXGI 98/99       | `-f BC7_UNORM`         |
-| RGBA8  | DDPF_RGB, 32 bits, alpha   | `-f R8G8B8A8_UNORM`    |
-| RGB8   | DDPF_RGB, 24 bits          | `-f R8G8B8A8_UNORM` *  |
-| L8     | DDPF_LUMINANCE             | `-f R8_UNORM`          |
+| Tag    | DDS source                 | Re-encode flag (UNORM / _SRGB)      |
+| ------ | --------------------------- | ------------------------------------ |
+| DXT1   | FOURCC `DXT1`, or DX10 71/72 | `BC1_UNORM` / `BC1_UNORM_SRGB`       |
+| DXT3   | FOURCC `DXT3`, or DX10 74/75 | `BC2_UNORM` / `BC2_UNORM_SRGB`       |
+| DXT5   | FOURCC `DXT5`, or DX10 77/78 | `BC3_UNORM` / `BC3_UNORM_SRGB`       |
+| BC5    | FOURCC `ATI2`/`BC5U`, DX10 83| `BC5_UNORM` (no sRGB variant exists) |
+| BC7    | DX10 ext, DXGI 98/99         | `BC7_UNORM` / `BC7_UNORM_SRGB`       |
+| RGBA8  | DDPF_RGB, 32 bits, alpha     | `R8G8B8A8_UNORM` / `..._SRGB`        |
+| RGB8   | DDPF_RGB, 24 bits            | `B8G8R8X8_UNORM` / `..._SRGB` *      |
+| L8     | DDPF_LUMINANCE               | `R8_UNORM` (no sRGB variant exists)  |
 
-\* RGB8 is promoted to RGBA8 on re-encode — clean way to handle the 24-bit edge
-case without writing format-aware texconv plumbing. Unknown formats default to
-`BC3_UNORM` (safe — supports alpha).
+\* DDS/DXGI has no true 24-bit-packed format, so RGB8 re-encodes to
+`B8G8R8X8_UNORM` — 32-bit but with the X (alpha) channel genuinely ignored,
+unlike promoting to `R8G8B8A8_UNORM` which would add a spurious
+always-opaque alpha channel the 24-bit source never had.
 
-The `encode` phase passes `-m 0` to texconv, which generates a full mipmap
-chain at the new (`--ship-scale`, default 4×) dimensions, so each upscaled
-texture ends with the same mip pyramid the runtime expects.
+Anything `texconv_format_for` doesn't recognize (`fmt == 'UNKNOWN'` — a DX10
+DXGI code or legacy pixel-format combination this pipeline doesn't have a
+mapping for) is **never guessed at**. It's skipped with a loud warning and
+ships as the original via client fallback, the same as an
+`EXCLUDED_CATEGORIES` file — silently forcing an unrecognized format through
+`BC3_UNORM` risks encoding it with the wrong bit layout, producing a corrupt
+or unreadable texture in-game.
+
+The `encode` phase passes `-m <mips>` to texconv using the **source's own
+recorded mip count** (`encode_mip_count`), not an unconditional full chain —
+a texture authored with a short/partial mip chain keeps that same depth at
+the new shipped size, only clamped down if the shipped size is too small to
+physically hold that many levels (see `--max-dim`/`--max-source-dim`).
+
+After texconv writes each DDS, it's re-parsed and checked
+(`verify_encoded_dds`) against the dimensions, format, and mip count it was
+supposed to have. A mismatch — texconv silently ignoring a flag, a stale
+file left from a different format, a corrupted write — gets discarded
+rather than shipped; the next `encode` run (no `--overwrite` needed, since
+the bad file no longer exists) regenerates it.
 
 ## Deploying (sharded output)
 
